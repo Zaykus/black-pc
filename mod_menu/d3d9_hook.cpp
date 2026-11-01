@@ -87,7 +87,7 @@ static bool g_bMenuOpen = false;
 static bool g_bImGuiInit = false;
 
 // Cheat Toggles
-static bool g_bGodMode = false;
+extern "C" bool g_bDamageImmunity = false;
 static bool g_bInfAmmo = false;
 static bool g_bInfGrenades = false;
 static bool g_bWireframe = false;
@@ -109,7 +109,32 @@ static uint8_t g_OrigAmmo[4] = {0x66, 0xFF, 0x48, 0x18};
 static uint8_t g_OrigGren1[4] = {0x66, 0xFF, 0x4E, 0x0E};
 static uint8_t g_OrigGren2[4] = {0x66, 0xFF, 0x4E, 0x0E};
 static uint8_t g_OrigGren3[4] = {0x66, 0x89, 0x4E, 0x0E};
-static uint8_t g_OrigGodPrologue[32] = {0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF0};
+static uint8_t g_OrigDamageHook[7] = {0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8, 0x51};
+
+// Naked hook at FUN_001e3b50: ecx = HealthComponent (this)
+__attribute__((naked)) void Hook_ApplyDamage() {
+    __asm__(
+        "cmpb $0, _g_bDamageImmunity\n"
+        "je 1f\n"
+        "movl 0x002D1988, %eax\n"
+        "testl %eax, %eax\n"
+        "jz 1f\n"
+        "addl $0x22B10, %eax\n"
+        "cmpl %eax, %ecx\n"
+        "jne 1f\n"
+        // Player health component detected with Damage Immunity ON: ignore damage completely
+        "movl $0, 0x134(%ecx)\n"
+        "movl $0, 0x138(%ecx)\n"
+        "ret $4\n"
+        "1:\n"
+        "pushl %ebp\n"
+        "movl %esp, %ebp\n"
+        "andl $-8, %esp\n"
+        "pushl %ecx\n"
+        "pushl $0x001E3B57\n"
+        "ret\n"
+    );
+}
 
 static void ApplyCheats() {
     // 1. Infinite Ammo (VA 0x001EFBBB)
@@ -144,23 +169,35 @@ static void ApplyCheats() {
         }
     }
 
-    // 3. God Mode (Damage Filter Hook at VA 0x001D0730)
-    static bool s_lastGod = false;
-    if (g_bGodMode != s_lastGod) {
-        s_lastGod = g_bGodMode;
-        if (g_bGodMode) {
-            static uint8_t godHook[] = {
-                0x8B, 0x44, 0x24, 0x04,             // mov eax, [esp+4]
-                0x3B, 0x05, 0xD4, 0x45, 0x2D, 0x00, // cmp eax, [0x002D45D4]
-                0x75, 0x03,                         // jne skip
-                0xC2, 0x18, 0x00,                   // ret 0x18
-                0x55, 0x8B, 0xEC                    // push ebp; mov ebp, esp
-            };
-            PatchMemory(0x001D0730, godHook, sizeof(godHook), g_OrigGodPrologue);
-            Log("Cheat: God Mode ON");
+    // 3. Damage Immunity (Hook at VA 0x001E3B50)
+    static bool s_lastImmunity = false;
+    if (g_bDamageImmunity != s_lastImmunity) {
+        s_lastImmunity = g_bDamageImmunity;
+        if (g_bDamageImmunity) {
+            uint8_t patch[7];
+            patch[0] = 0xE9; // JMP rel32
+            uint32_t rel = (uint32_t)(uintptr_t)&Hook_ApplyDamage - (0x001E3B50 + 5);
+            memcpy(&patch[1], &rel, 4);
+            patch[5] = 0x90; // NOP
+            patch[6] = 0x90; // NOP
+            PatchMemory(0x001E3B50, patch, 7, g_OrigDamageHook);
+            Log("Cheat: Damage Immunity ON");
         } else {
-            PatchMemory(0x001D0730, g_OrigGodPrologue, 6);
-            Log("Cheat: God Mode OFF");
+            PatchMemory(0x001E3B50, g_OrigDamageHook, 7);
+            Log("Cheat: Damage Immunity OFF");
+        }
+    }
+
+    // Active health maintenance while Damage Immunity is active
+    if (g_bDamageImmunity) {
+        uint32_t pPlayerObj = *(uint32_t*)0x002D1988;
+        if (pPlayerObj > 0x10000) {
+            uint32_t pHealthComp = pPlayerObj + 0x22B10;
+            *(float*)(uintptr_t)(pHealthComp + 0x134) = 0.0f; // 0 damage in current segment
+            *(float*)(uintptr_t)(pHealthComp + 0x138) = 0.0f; // 0 total damage
+            if (*(uint32_t*)(uintptr_t)(pHealthComp + 0x9c) < 4) {
+                *(uint32_t*)(uintptr_t)(pHealthComp + 0x9c) = 4; // keep all health segments full
+            }
         }
     }
 
@@ -174,15 +211,13 @@ static void ApplyCheats() {
 }
 
 // --- Window Procedure Hook ---
-// Runs on the port's window thread, so it never touches ImGui directly (ImGui lives on the render thread).
-// It only collects the wheel and blocks the game's mouse while the menu is open.
 static volatile LONG g_WheelDelta = 0;
 
 static LRESULT CALLBACK Hooked_WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (g_bMenuOpen) {
         switch (msg) {
             case WM_INPUT:
-                // raw mouse drives the camera and firing in the port: swallow it while the menu is open
+                // raw mouse drives camera/firing: swallow while menu is open
                 return DefWindowProcW(hWnd, msg, wParam, lParam);
             case WM_MOUSEWHEEL:
                 InterlockedExchangeAdd(&g_WheelDelta, (SHORT)HIWORD(wParam));
@@ -190,9 +225,9 @@ static LRESULT CALLBACK Hooked_WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARA
             case WM_LBUTTONDOWN: case WM_LBUTTONUP:
             case WM_RBUTTONDOWN: case WM_RBUTTONUP:
             case WM_MBUTTONDOWN: case WM_MBUTTONUP:
-                return 0; // keep the port from re-capturing (and hiding/clipping) the mouse
+                return 0;
             case WM_SETCURSOR:
-                SetCursor(nullptr); // ImGui draws its own cursor
+                SetCursor(nullptr);
                 return TRUE;
         }
     }
@@ -235,7 +270,7 @@ static void SetupImGuiStyle() {
 static void RenderModMenu() {
     if (!g_bMenuOpen) return;
 
-    ImGui::SetNextWindowSize(ImVec2(500, 420), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(520, 430), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("BLACK PC - MOD MENU [F1]", &g_bMenuOpen, ImGuiWindowFlags_NoCollapse)) {
         ImGui::TextColored(ImVec4(1.0f, 0.80f, 0.20f, 1.0f), "CRITERION BLACK (2006) - PC PORT ENHANCER");
         ImGui::TextDisabled("Press [F1] to close / open this menu");
@@ -245,7 +280,7 @@ static void RenderModMenu() {
             // --- TAB 1: PLAYER ---
             if (ImGui::BeginTabItem("Player")) {
                 ImGui::Spacing();
-                ImGui::Checkbox("God Mode (Invulnerability)", &g_bGodMode);
+                ImGui::Checkbox("Damage Immunity", &g_bDamageImmunity);
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("Immunity to bullets, explosions, and all incoming damage!");
 
@@ -253,9 +288,12 @@ static void RenderModMenu() {
                 ImGui::Separator();
                 ImGui::Spacing();
 
-                uint32_t pPlayer = *(uint32_t*)0x002D45D4;
-                if (pPlayer) {
-                    ImGui::Text("Player Entity Active: 0x%08X", pPlayer);
+                uint32_t pPlayerObj = *(uint32_t*)0x002D1988;
+                if (pPlayerObj > 0x10000) {
+                    ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.4f, 1.0f), "Player Status: Active (0x%08X)", pPlayerObj);
+                    uint32_t pHealthComp = pPlayerObj + 0x22B10;
+                    uint32_t pips = *(uint32_t*)(uintptr_t)(pHealthComp + 0x9c);
+                    ImGui::Text("Health Segments: %u / 4", pips);
                 } else {
                     ImGui::TextDisabled("Player inactive (in menu or cutscene)");
                 }
@@ -333,7 +371,7 @@ static HRESULT WINAPI Hook_Present(IDirect3DDevice9* pDevice, const RECT* pSrc, 
 
     ApplyCheats();
 
-    // F1 polled every frame (the port reads keys with GetAsyncKeyState too); only while the game window is in front
+    // F1 strictly polled every frame
     static bool s_bF1WasDown = false;
     bool bF1IsDown = (GetAsyncKeyState(VK_F1) & 0x8000) != 0 && (!g_hWnd || GetForegroundWindow() == g_hWnd);
     if (bF1IsDown && !s_bF1WasDown) {
@@ -342,7 +380,7 @@ static HRESULT WINAPI Hook_Present(IDirect3DDevice9* pDevice, const RECT* pSrc, 
         if (g_bMenuOpen) ClipCursor(nullptr);
     }
     s_bF1WasDown = bF1IsDown;
-    if (g_bMenuOpen) ClipCursor(nullptr); // the port may clip again on its own
+    if (g_bMenuOpen) ClipCursor(nullptr);
 
     if (!g_bImGuiInit) {
         if (!g_hWnd) {
@@ -366,7 +404,6 @@ static HRESULT WINAPI Hook_Present(IDirect3DDevice9* pDevice, const RECT* pSrc, 
     }
 
     if (g_bImGuiInit && g_bMenuOpen) {
-        // The part of the back buffer this frame uses (the port presents a sub-rectangle, stretched to the window)
         IDirect3DSurface9* backBuffer = nullptr;
         if (FAILED(pDevice->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuffer)) || !backBuffer)
             return Orig_Present(pDevice, pSrc, pDest, hWndDest, pDirty);
@@ -384,7 +421,7 @@ static HRESULT WINAPI Hook_Present(IDirect3DDevice9* pDevice, const RECT* pSrc, 
         GetClientRect(g_hWnd, &client);
         float clientW = (float)(client.right - client.left), clientH = (float)(client.bottom - client.top);
         io.DisplaySize = ImVec2(frameW, frameH);
-        // mouse: window pixels -> frame pixels; buttons polled here on the render thread
+
         POINT pt;
         if (GetCursorPos(&pt) && ScreenToClient(g_hWnd, &pt) && clientW > 0 && clientH > 0)
             io.AddMousePosEvent(pt.x * frameW / clientW, pt.y * frameH / clientH);
@@ -399,7 +436,7 @@ static HRESULT WINAPI Hook_Present(IDirect3DDevice9* pDevice, const RECT* pSrc, 
         ImGui::EndFrame();
         ImGui::Render();
 
-        // Save everything, draw onto the real back buffer (the port may still have an offscreen target bound)
+        // Save D3D9 state and render onto the real back buffer
         IDirect3DStateBlock9* sb = nullptr;
         pDevice->CreateStateBlock(D3DSBT_ALL, &sb);
         IDirect3DSurface9* oldRT = nullptr;
@@ -417,7 +454,21 @@ static HRESULT WINAPI Hook_Present(IDirect3DDevice9* pDevice, const RECT* pSrc, 
         pDevice->SetRenderState(D3DRS_FILLMODE, D3DFILL_SOLID);
         pDevice->SetRenderState(D3DRS_STENCILENABLE, FALSE);
         pDevice->SetRenderState(D3DRS_MULTISAMPLEANTIALIAS, FALSE);
-        for (DWORD s = 0; s < 8; s++) pDevice->SetSamplerState(s, D3DSAMP_SRGBTEXTURE, FALSE);
+
+        // Crucial: reset texture transforms and stages so font glyph UVs are not scrambled
+        D3DMATRIX mat_identity = { { { 1.0f, 0.0f, 0.0f, 0.0f,  0.0f, 1.0f, 0.0f, 0.0f,  0.0f, 0.0f, 1.0f, 0.0f,  0.0f, 0.0f, 0.0f, 1.0f } } };
+        for (DWORD i = 0; i < 8; i++) {
+            pDevice->SetTextureStageState(i, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+            pDevice->SetTextureStageState(i, D3DTSS_TEXCOORDINDEX, i);
+            pDevice->SetTransform((D3DTRANSFORMSTATETYPE)(D3DTS_TEXTURE0 + i), &mat_identity);
+            pDevice->SetSamplerState(i, D3DSAMP_SRGBTEXTURE, FALSE);
+            pDevice->SetSamplerState(i, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+            if (i > 0) {
+                pDevice->SetTextureStageState(i, D3DTSS_COLOROP, D3DTOP_DISABLE);
+                pDevice->SetTextureStageState(i, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+                pDevice->SetTexture(i, nullptr);
+            }
+        }
 
         HRESULT hrBegin = pDevice->BeginScene();
         ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
@@ -431,7 +482,7 @@ static HRESULT WINAPI Hook_Present(IDirect3DDevice9* pDevice, const RECT* pSrc, 
         backBuffer->Release();
     }
 
-    // Wireframe: applied to the next frame's draws (the port sets FILLMODE rarely)
+    // Wireframe Mode
     static bool s_lastWire = false;
     if (g_bWireframe != s_lastWire) {
         s_lastWire = g_bWireframe;
