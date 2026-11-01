@@ -12,7 +12,15 @@
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 static void Log(const char* fmt, ...) {
-    FILE* f = fopen("mod_menu.log", "a");
+    static char path[MAX_PATH] = {};
+    if (!path[0]) {
+        HMODULE self = nullptr;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)&Log, &self);
+        GetModuleFileNameA(self, path, MAX_PATH);
+        char* slash = strrchr(path, '\\');
+        strcpy(slash ? slash + 1 : path, "mod_menu.log");
+    }
+    FILE* f = fopen(path, "a");
     if (!f) return;
     va_list va;
     va_start(va, fmt);
@@ -166,26 +174,26 @@ static void ApplyCheats() {
 }
 
 // --- Window Procedure Hook ---
+// Runs on the port's window thread, so it never touches ImGui directly (ImGui lives on the render thread).
+// It only collects the wheel and blocks the game's mouse while the menu is open.
+static volatile LONG g_WheelDelta = 0;
+
 static LRESULT CALLBACK Hooked_WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (g_bMenuOpen) {
-        ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam);
-        ImGuiIO& io = ImGui::GetIO();
-        if (io.WantCaptureMouse) {
-            switch (msg) {
-                case WM_LBUTTONDOWN: case WM_LBUTTONUP:
-                case WM_RBUTTONDOWN: case WM_RBUTTONUP:
-                case WM_MBUTTONDOWN: case WM_MBUTTONUP:
-                case WM_MOUSEMOVE:
-                case WM_MOUSEWHEEL:
-                    return 0;
-            }
-        }
-        if (io.WantCaptureKeyboard) {
-            switch (msg) {
-                case WM_KEYDOWN: case WM_KEYUP:
-                case WM_CHAR:
-                    return 0;
-            }
+        switch (msg) {
+            case WM_INPUT:
+                // raw mouse drives the camera and firing in the port: swallow it while the menu is open
+                return DefWindowProcW(hWnd, msg, wParam, lParam);
+            case WM_MOUSEWHEEL:
+                InterlockedExchangeAdd(&g_WheelDelta, (SHORT)HIWORD(wParam));
+                return 0;
+            case WM_LBUTTONDOWN: case WM_LBUTTONUP:
+            case WM_RBUTTONDOWN: case WM_RBUTTONUP:
+            case WM_MBUTTONDOWN: case WM_MBUTTONUP:
+                return 0; // keep the port from re-capturing (and hiding/clipping) the mouse
+            case WM_SETCURSOR:
+                SetCursor(nullptr); // ImGui draws its own cursor
+                return TRUE;
         }
     }
 
@@ -325,20 +333,16 @@ static HRESULT WINAPI Hook_Present(IDirect3DDevice9* pDevice, const RECT* pSrc, 
 
     ApplyCheats();
 
-    // Check F1 key state directly every frame (hardware query, immune to window message swallowing)
+    // F1 polled every frame (the port reads keys with GetAsyncKeyState too); only while the game window is in front
     static bool s_bF1WasDown = false;
-    bool bF1IsDown = (GetAsyncKeyState(VK_F1) & 0x8000) != 0;
+    bool bF1IsDown = (GetAsyncKeyState(VK_F1) & 0x8000) != 0 && (!g_hWnd || GetForegroundWindow() == g_hWnd);
     if (bF1IsDown && !s_bF1WasDown) {
         g_bMenuOpen = !g_bMenuOpen;
         Log("F1 PRESSED! g_bMenuOpen = %d", g_bMenuOpen);
-        if (g_bMenuOpen) {
-            ClipCursor(nullptr);
-            ShowCursor(TRUE);
-        } else {
-            ShowCursor(FALSE);
-        }
+        if (g_bMenuOpen) ClipCursor(nullptr);
     }
     s_bF1WasDown = bF1IsDown;
+    if (g_bMenuOpen) ClipCursor(nullptr); // the port may clip again on its own
 
     if (!g_bImGuiInit) {
         if (!g_hWnd) {
@@ -361,48 +365,77 @@ static HRESULT WINAPI Hook_Present(IDirect3DDevice9* pDevice, const RECT* pSrc, 
         }
     }
 
-    if (g_bImGuiInit) {
-        if (g_bWireframe) {
-            pDevice->SetRenderState(D3DRS_FILLMODE, D3DFILL_WIREFRAME);
-        }
+    if (g_bImGuiInit && g_bMenuOpen) {
+        // The part of the back buffer this frame uses (the port presents a sub-rectangle, stretched to the window)
+        IDirect3DSurface9* backBuffer = nullptr;
+        if (FAILED(pDevice->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuffer)) || !backBuffer)
+            return Orig_Present(pDevice, pSrc, pDest, hWndDest, pDirty);
+        D3DSURFACE_DESC bbDesc = {};
+        backBuffer->GetDesc(&bbDesc);
+        float frameW = pSrc ? (float)(pSrc->right - pSrc->left) : (float)bbDesc.Width;
+        float frameH = pSrc ? (float)(pSrc->bottom - pSrc->top) : (float)bbDesc.Height;
 
         ImGui_ImplDX9_NewFrame();
         ImGui_ImplWin32_NewFrame();
+
+        ImGuiIO& io = ImGui::GetIO();
+        io.MouseDrawCursor = true;
+        RECT client = {};
+        GetClientRect(g_hWnd, &client);
+        float clientW = (float)(client.right - client.left), clientH = (float)(client.bottom - client.top);
+        io.DisplaySize = ImVec2(frameW, frameH);
+        // mouse: window pixels -> frame pixels; buttons polled here on the render thread
+        POINT pt;
+        if (GetCursorPos(&pt) && ScreenToClient(g_hWnd, &pt) && clientW > 0 && clientH > 0)
+            io.AddMousePosEvent(pt.x * frameW / clientW, pt.y * frameH / clientH);
+        bool swap = GetSystemMetrics(SM_SWAPBUTTON) != 0;
+        io.AddMouseButtonEvent(0, (GetAsyncKeyState(swap ? VK_RBUTTON : VK_LBUTTON) & 0x8000) != 0);
+        io.AddMouseButtonEvent(1, (GetAsyncKeyState(swap ? VK_LBUTTON : VK_RBUTTON) & 0x8000) != 0);
+        LONG wheel = InterlockedExchange(&g_WheelDelta, 0);
+        if (wheel) io.AddMouseWheelEvent(0.0f, (float)wheel / WHEEL_DELTA);
+
         ImGui::NewFrame();
-
         RenderModMenu();
-
         ImGui::EndFrame();
+        ImGui::Render();
 
-        // State backup to guarantee clean rendering over any engine shaders
-        DWORD fvf = 0;
-        IDirect3DVertexDeclaration9* vdecl = nullptr;
-        IDirect3DVertexShader9* vshader = nullptr;
-        IDirect3DPixelShader9* pshader = nullptr;
-        pDevice->GetFVF(&fvf);
-        pDevice->GetVertexDeclaration(&vdecl);
-        pDevice->GetVertexShader(&vshader);
-        pDevice->GetPixelShader(&pshader);
+        // Save everything, draw onto the real back buffer (the port may still have an offscreen target bound)
+        IDirect3DStateBlock9* sb = nullptr;
+        pDevice->CreateStateBlock(D3DSBT_ALL, &sb);
+        IDirect3DSurface9* oldRT = nullptr;
+        IDirect3DSurface9* oldDS = nullptr;
+        pDevice->GetRenderTarget(0, &oldRT);
+        pDevice->GetDepthStencilSurface(&oldDS);
 
+        pDevice->SetRenderTarget(0, backBuffer);
+        for (DWORD i = 1; i < 4; i++) pDevice->SetRenderTarget(i, nullptr);
+        pDevice->SetDepthStencilSurface(nullptr);
         pDevice->SetVertexShader(nullptr);
         pDevice->SetPixelShader(nullptr);
+        pDevice->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+        pDevice->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
+        pDevice->SetRenderState(D3DRS_FILLMODE, D3DFILL_SOLID);
+        pDevice->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+        pDevice->SetRenderState(D3DRS_MULTISAMPLEANTIALIAS, FALSE);
+        for (DWORD s = 0; s < 8; s++) pDevice->SetSamplerState(s, D3DSAMP_SRGBTEXTURE, FALSE);
 
         HRESULT hrBegin = pDevice->BeginScene();
-        ImGui::Render();
         ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
-        if (SUCCEEDED(hrBegin)) {
-            pDevice->EndScene();
-        }
+        if (SUCCEEDED(hrBegin)) pDevice->EndScene();
 
-        // Restore state
-        pDevice->SetFVF(fvf);
-        if (vdecl) { pDevice->SetVertexDeclaration(vdecl); vdecl->Release(); }
-        if (vshader) { pDevice->SetVertexShader(vshader); vshader->Release(); }
-        if (pshader) { pDevice->SetPixelShader(pshader); pshader->Release(); }
+        pDevice->SetRenderTarget(0, oldRT);
+        pDevice->SetDepthStencilSurface(oldDS);
+        if (oldRT) oldRT->Release();
+        if (oldDS) oldDS->Release();
+        if (sb) { sb->Apply(); sb->Release(); }
+        backBuffer->Release();
+    }
 
-        if (g_bWireframe) {
-            pDevice->SetRenderState(D3DRS_FILLMODE, D3DFILL_SOLID);
-        }
+    // Wireframe: applied to the next frame's draws (the port sets FILLMODE rarely)
+    static bool s_lastWire = false;
+    if (g_bWireframe != s_lastWire) {
+        s_lastWire = g_bWireframe;
+        pDevice->SetRenderState(D3DRS_FILLMODE, g_bWireframe ? D3DFILL_WIREFRAME : D3DFILL_SOLID);
     }
 
     return Orig_Present(pDevice, pSrc, pDest, hWndDest, pDirty);
