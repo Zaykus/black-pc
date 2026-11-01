@@ -109,32 +109,14 @@ static uint8_t g_OrigAmmo[4] = {0x66, 0xFF, 0x48, 0x18};
 static uint8_t g_OrigGren1[4] = {0x66, 0xFF, 0x4E, 0x0E};
 static uint8_t g_OrigGren2[4] = {0x66, 0xFF, 0x4E, 0x0E};
 static uint8_t g_OrigGren3[4] = {0x66, 0x89, 0x4E, 0x0E};
-static uint8_t g_OrigDamageHook[7] = {0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8, 0x51};
+static uint8_t g_OrigGren4[7] = {0x66, 0x8B, 0x4E, 0x0E, 0x0F, 0xBF, 0xD1};
 
-// Naked hook at FUN_001e3b50: ecx = HealthComponent (this)
-__attribute__((naked)) void Hook_ApplyDamage() {
-    __asm__(
-        "cmpb $0, _g_bDamageImmunity\n"
-        "je 1f\n"
-        "movl 0x002D1988, %eax\n"
-        "testl %eax, %eax\n"
-        "jz 1f\n"
-        "addl $0x22B10, %eax\n"
-        "cmpl %eax, %ecx\n"
-        "jne 1f\n"
-        // Player health component detected with Damage Immunity ON: ignore damage completely
-        "movl $0, 0x134(%ecx)\n"
-        "movl $0, 0x138(%ecx)\n"
-        "ret $4\n"
-        "1:\n"
-        "pushl %ebp\n"
-        "movl %esp, %ebp\n"
-        "andl $-8, %esp\n"
-        "pushl %ecx\n"
-        "pushl $0x001E3B57\n"
-        "ret\n"
-    );
-}
+static uint8_t g_OrigDamageBranch1[8] = {0xF3, 0x0F, 0x10, 0x88, 0x34, 0x01, 0x00, 0x00};
+static uint8_t g_OrigDamageBranch2[8] = {0xF3, 0x0F, 0x10, 0x88, 0x34, 0x01, 0x00, 0x00};
+
+static uint32_t s_origFOV1 = 0x002888C8;
+static uint32_t s_origFOV2 = 0x002888C8;
+static uint32_t s_origFOV3 = 0x002888C8;
 
 static void ApplyCheats() {
     // 1. Infinite Ammo (VA 0x001EFBBB)
@@ -151,60 +133,105 @@ static void ApplyCheats() {
         }
     }
 
-    // 2. Infinite Grenades (VA 0x00043820, 0x00043866, 0x00043872)
+    // 2. Infinite Grenades (VA 0x00043820, 0x00043866, 0x00043872, 0x00043845)
     static bool s_lastInfGrenades = false;
     if (g_bInfGrenades != s_lastInfGrenades) {
         s_lastInfGrenades = g_bInfGrenades;
         if (g_bInfGrenades) {
-            uint8_t nops[4] = {0x90, 0x90, 0x90, 0x90};
-            PatchMemory(0x00043820, nops, 4, g_OrigGren1);
-            PatchMemory(0x00043866, nops, 4, g_OrigGren2);
-            PatchMemory(0x00043872, nops, 4, g_OrigGren3);
+            uint8_t nops4[4] = {0x90, 0x90, 0x90, 0x90};
+            uint8_t forceGren[7] = {0x66, 0xC7, 0x46, 0x0E, 0x09, 0x00, 0x90}; // mov word ptr [esi+0x0e], 9; nop
+            PatchMemory(0x00043820, nops4, 4, g_OrigGren1);
+            PatchMemory(0x00043866, nops4, 4, g_OrigGren2);
+            PatchMemory(0x00043872, nops4, 4, g_OrigGren3);
+            PatchMemory(0x00043845, forceGren, 7, g_OrigGren4);
             Log("Cheat: Infinite Grenades ON");
         } else {
             PatchMemory(0x00043820, g_OrigGren1, 4);
             PatchMemory(0x00043866, g_OrigGren2, 4);
             PatchMemory(0x00043872, g_OrigGren3, 4);
+            PatchMemory(0x00043845, g_OrigGren4, 7);
             Log("Cheat: Infinite Grenades OFF");
         }
     }
 
-    // 3. Damage Immunity (Hook at VA 0x001E3B50)
+    // Ensure player always has grenades when Infinite Grenades is active
+    if (g_bInfGrenades) {
+        uint32_t pPtr = *(uint32_t*)0x002D12CC;
+        if (pPtr > 0x10000 && !IsBadReadPtr((void*)(uintptr_t)pPtr, sizeof(uint32_t))) {
+            uint32_t pData = *(uint32_t*)(uintptr_t)pPtr;
+            if (pData > 0x10000 && !IsBadWritePtr((void*)(uintptr_t)pData, 0x40)) {
+                if (*(int16_t*)(uintptr_t)(pData + 0x1C) < 9) *(int16_t*)(uintptr_t)(pData + 0x1C) = 9;
+                if (*(int16_t*)(uintptr_t)(pData + 0x1E) < 9) *(int16_t*)(uintptr_t)(pData + 0x1E) = 9;
+                if (*(int16_t*)(uintptr_t)(pData + 0x2A) < 9) *(int16_t*)(uintptr_t)(pData + 0x2A) = 9;
+            }
+        }
+    }
+
+    // 3. Damage Immunity (Safe return patch at VA 0x001E3BA8 and 0x001E3BE1)
     static bool s_lastImmunity = false;
     if (g_bDamageImmunity != s_lastImmunity) {
         s_lastImmunity = g_bDamageImmunity;
         if (g_bDamageImmunity) {
-            uint8_t patch[7];
-            patch[0] = 0xE9; // JMP rel32
-            uint32_t rel = (uint32_t)(uintptr_t)&Hook_ApplyDamage - (0x001E3B50 + 5);
-            memcpy(&patch[1], &rel, 4);
-            patch[5] = 0x90; // NOP
-            patch[6] = 0x90; // NOP
-            PatchMemory(0x001E3B50, patch, 7, g_OrigDamageHook);
+            // Immediate safe return: pop ebx; mov esp, ebp; pop ebp; ret $4; nop
+            uint8_t immPatch[8] = {0x5B, 0x8B, 0xE5, 0x5D, 0xC2, 0x04, 0x00, 0x90};
+            PatchMemory(0x001E3BA8, immPatch, 8, g_OrigDamageBranch2);
+            PatchMemory(0x001E3BE1, immPatch, 8, g_OrigDamageBranch1);
             Log("Cheat: Damage Immunity ON");
         } else {
-            PatchMemory(0x001E3B50, g_OrigDamageHook, 7);
+            PatchMemory(0x001E3BA8, g_OrigDamageBranch2, 8);
+            PatchMemory(0x001E3BE1, g_OrigDamageBranch1, 8);
             Log("Cheat: Damage Immunity OFF");
         }
     }
 
     // Active health maintenance while Damage Immunity is active
     if (g_bDamageImmunity) {
-        uint32_t pPlayerObj = *(uint32_t*)0x002D1988;
-        if (pPlayerObj > 0x10000) {
-            uint32_t pHealthComp = pPlayerObj + 0x22B10;
-            *(float*)(uintptr_t)(pHealthComp + 0x134) = 0.0f; // 0 damage in current segment
-            *(float*)(uintptr_t)(pHealthComp + 0x138) = 0.0f; // 0 total damage
-            if (*(uint32_t*)(uintptr_t)(pHealthComp + 0x9c) < 4) {
-                *(uint32_t*)(uintptr_t)(pHealthComp + 0x9c) = 4; // keep all health segments full
-            }
+        uint32_t pGame = *(uint32_t*)0x002D45F0;
+        if (pGame > 0x10000 && !IsBadReadPtr((void*)(uintptr_t)pGame, 0x20170)) {
+            *(uint32_t*)(uintptr_t)(pGame + 0x2014C) = 3;    // Keep 3 health packs
+            *(uint32_t*)(uintptr_t)(pGame + 0x20150) = 4;    // 4 health segments
+            *(uint32_t*)(uintptr_t)(pGame + 0x20154) = 4;    // 4 max segments
+            *(float*)(uintptr_t)(pGame + 0x20158) = 1.0f;    // 100% current segment
+            *(float*)(uintptr_t)(pGame + 0x2015C) = 1.0f;    // 100% display
+            *(float*)(uintptr_t)(pGame + 0x20160) = 1.0f;    // 100% overall
+        }
+
+        *(uint32_t*)0x002F4178 = 4;
+        *(uint32_t*)0x002F417C = 100;
+        *(uint32_t*)0x002F416C = 100;
+        *(uint32_t*)0x002F4170 = 100;
+
+        uint32_t pRend = *(uint32_t*)0x002D67F4;
+        if (pRend > 0x10000 && !IsBadReadPtr((void*)(uintptr_t)pRend, 0xE000)) {
+            *(float*)(uintptr_t)(pRend + 0xD5B4) = 1.0f;
         }
     }
 
-    // 4. Custom FOV in real time
+    // 4. Custom Field of View (FOV)
+    static bool s_lastCustomFOV = false;
+    if (g_bCustomFOV != s_lastCustomFOV) {
+        s_lastCustomFOV = g_bCustomFOV;
+        if (g_bCustomFOV) {
+            s_origFOV1 = *(uint32_t*)0x001BB2CE;
+            s_origFOV2 = *(uint32_t*)0x00202F96;
+            s_origFOV3 = *(uint32_t*)0x002038E9;
+
+            uint32_t target = (uint32_t)(uintptr_t)&g_fCustomFOV;
+            PatchMemory(0x001BB2CE, &target, 4);
+            PatchMemory(0x00202F96, &target, 4);
+            PatchMemory(0x002038E9, &target, 4);
+            Log("Cheat: Custom FOV ON (pointing to %p)", &g_fCustomFOV);
+        } else {
+            PatchMemory(0x001BB2CE, &s_origFOV1, 4);
+            PatchMemory(0x00202F96, &s_origFOV2, 4);
+            PatchMemory(0x002038E9, &s_origFOV3, 4);
+            Log("Cheat: Custom FOV OFF (restored)");
+        }
+    }
+
     if (g_bCustomFOV) {
         uint32_t pCameraMgr = *(uint32_t*)0x002D12B8;
-        if (pCameraMgr && pCameraMgr > 0x10000) {
+        if (pCameraMgr && pCameraMgr > 0x10000 && !IsBadReadPtr((void*)(uintptr_t)pCameraMgr, 0x800)) {
             *(float*)(uintptr_t)(pCameraMgr + 0x750) = g_fCustomFOV;
         }
     }
@@ -288,12 +315,14 @@ static void RenderModMenu() {
                 ImGui::Separator();
                 ImGui::Spacing();
 
-                uint32_t pPlayerObj = *(uint32_t*)0x002D1988;
-                if (pPlayerObj > 0x10000) {
-                    ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.4f, 1.0f), "Player Status: Active (0x%08X)", pPlayerObj);
-                    uint32_t pHealthComp = pPlayerObj + 0x22B10;
-                    uint32_t pips = *(uint32_t*)(uintptr_t)(pHealthComp + 0x9c);
-                    ImGui::Text("Health Segments: %u / 4", pips);
+                uint32_t pGame = *(uint32_t*)0x002D45F0;
+                if (pGame > 0x10000 && !IsBadReadPtr((void*)(uintptr_t)pGame, 0x20170)) {
+                    uint32_t pips = *(uint32_t*)(uintptr_t)(pGame + 0x20150);
+                    float segHp = *(float*)(uintptr_t)(pGame + 0x20158) * 100.0f;
+                    uint32_t packs = *(uint32_t*)(uintptr_t)(pGame + 0x2014C);
+                    ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.4f, 1.0f), "Player Status: Active");
+                    ImGui::Text("Health Segments: %u / 4 (%.0f%%)", pips, segHp);
+                    ImGui::Text("Health Packs: %u", packs);
                 } else {
                     ImGui::TextDisabled("Player inactive (in menu or cutscene)");
                 }
